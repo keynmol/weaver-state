@@ -4,12 +4,20 @@ import weaver._
 import cats.effect._
 import cats.effect.concurrent.Ref
 
+import monocle.macros.Lenses
+
+import monocle._
+import monocle.std._
+import monocle.syntax._
+import monocle.function._
+
 import cats.data.Chain
 import cats.data.State
 import cats.Monad
 import cats.syntax.all._
 import com.softwaremill.diffx.Diff
 import cats.data.NonEmptyChain
+import monocle.macros.GenLens
 
 object types {
   type UserId = Int
@@ -40,14 +48,16 @@ class TrackingState[F[_]: Monad: Log, T: Diff] private (
   def indent(s: String, tabs: Int = 4) =
     " " * tabs + s.replace("\n" + (" " * 5), "")
 
-  def get: F[T]                  = rf.get
+  def get: F[T]                                        = rf.get
   def updateLabeled(label: String)(f: T => T): F[Unit] =
     rf.updateAndGet(f).flatMap { current =>
       for {
         latest    <- track.get.map(_.last)
         difference = compare(latest, current)
         _         <- track.update(_.append(current))
-        _         <- Log[F].info(s"Updating state", Map(label -> indent(difference.show, 0)))
+        _         <-
+          Log[F]
+            .info(s"Updating state", Map(label -> indent(difference.show, 0)))
       } yield ()
     }
 }
@@ -59,19 +69,29 @@ object TrackingState {
   } yield new TrackingState(r1, r2)
 }
 
-class InMemoryUserRepo(state: TrackingState[IO, Map[Int, User]])
+case class UserDatabaseState(records: Map[UserId, User] = Map.empty)
+class InMemoryUserRepo(state: TrackingState[IO, UserDatabaseState])
     extends UserRepo[IO] {
-  override def getUser(id: Int): IO[Option[User]]                   = state.get.map(_.get(id))
-  override def updateBalance(id: UserId, newBalance: Int): IO[Unit] =
+
+  val records = GenLens[UserDatabaseState](_.records)
+
+  override def getUser(id: Int): IO[Option[User]] =
+    state.get.map(_.records.get(id))
+  override def updateBalance(id: UserId, newBalance: Int): IO[Unit] = {
+    records.at(id).modify(_ + newBalance)
+
     state.updateLabeled("updating balance") { mp =>
-      mp.updatedWith(id) {
+      mp.copy(records = mp.records.updatedWith(id) {
         case Some(us) => Some(us.copy(balance = newBalance))
         case _        => None
-      }
+      })
     }
+  }
 
   override def registerUser(user: User): IO[Unit] =
-    state.updateLabeled("registering")(_.updated(user.id, user))
+    state.updateLabeled("registering")(mp =>
+      mp.copy(records = mp.records.updated(user.id, user))
+    )
 }
 
 object Experiment extends SimpleIOSuite {
@@ -79,12 +99,12 @@ object Experiment extends SimpleIOSuite {
 
   loggedTest("example") { implicit log =>
     for {
-      state      <- TrackingState.create[IO, Map[UserId, User]](Map())
+      state      <- TrackingState.create[IO, UserDatabaseState](UserDatabaseState())
       repo        = new InMemoryUserRepo(state)
       _          <- repo.registerUser(User(5, 25))
       _          <- repo.updateBalance(5, 500)
       _          <- repo.registerUser(User(11, 300))
-      finalState <- state.get
+      finalState <- state.get.map(_.records)
     } yield {
       expect(finalState.get(5) == Some(User(5, 501)))
     }
